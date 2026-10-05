@@ -11,6 +11,7 @@ config: --base-url (or EMBEDX_BASE_URL / OPENAI_BASE_URL),
         --model (or EMBEDX_MODEL, default text-embedding-3-small).
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -141,6 +142,18 @@ def load_index(path):
         raise EmbedxError("cannot read index %s: %s" % (path, e))
 
 
+def file_hash(path):
+    # sha256 of the raw bytes, used to skip unchanged files on re-index
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for buf in iter(lambda: f.read(65536), b""):
+                h.update(buf)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
 def cmd_index(args):
     root = os.path.abspath(args.dir)
     if not os.path.isdir(root):
@@ -150,34 +163,67 @@ def cmd_index(args):
         exts = [e if e.startswith(".") else "." + e
                 for e in args.exts.split(",") if e.strip()]
     files = iter_files(root, exts)
+    ipath = index_path_for(args, root)
+    # never index our own output file
+    ipath_abs = os.path.abspath(ipath)
+    files = [f for f in files if os.path.abspath(f) != ipath_abs]
+    old = None
+    if os.path.exists(ipath):
+        try:
+            old = load_index(ipath)
+        except EmbedxError:
+            old = None  # corrupt index, rebuild from scratch
+    old_chunks = {}
+    old_hashes = {}
+    if isinstance(old, dict):
+        if not args.force and old.get("model", args.model) == args.model:
+            old_hashes = old.get("hashes") or {}
+            for c in old.get("chunks") or []:
+                old_chunks.setdefault(c["file"], []).append(c)
+        # a changed model re-embeds everything: old vectors belong to a
+        # different model and would poison search results
     chunks = []
+    todo = []  # (chunk index, text) pairs that still need embedding
+    hashes = {}
+    reused = 0
     for path in files:
         text = read_text(path)
         if text is None:
             continue
         rel = os.path.relpath(path, root)
-        lines = text.splitlines(keepends=True)
-        if not lines:
+        digest = file_hash(path)
+        hashes[rel] = digest
+        if digest and old_hashes.get(rel) == digest and rel in old_chunks:
+            # unchanged since the last index, keep the stored chunks as-is
+            chunks.extend(old_chunks[rel])
+            reused += len(old_chunks[rel])
             continue
-        for start, end, ctext in chunk_lines(lines):
+        for start, end, ctext in chunk_lines(text.splitlines(keepends=True)):
+            todo.append((len(chunks), ctext))
             chunks.append({"file": rel, "start": start, "end": end,
                            "text": ctext})
-    if not chunks:
+    if not chunks and old is None:
         print("embedx: nothing to index in %s" % root)
         return 0
-    vecs = embed([c["text"] for c in chunks], args.base_url, args.api_key,
-                 args.model, batch=args.batch)
-    for c, v in zip(chunks, vecs):
-        c["vec"] = v
-    dims = len(vecs[0]) if vecs else 0
-    data = {"version": 1, "model": args.model, "dims": dims,
+    if todo:
+        vecs = embed([t for _, t in todo], args.base_url, args.api_key,
+                     args.model, batch=args.batch)
+        for (i, _), v in zip(todo, vecs):
+            chunks[i]["vec"] = v
+    dims = 0
+    for c in chunks:
+        if "vec" in c:
+            dims = len(c["vec"])
+            break
+    if not dims:
+        dims = (old or {}).get("dims", 0)
+    data = {"version": 2, "model": args.model, "dims": dims,
             "files": sorted({c["file"] for c in chunks}),
-            "chunks": chunks}
-    ipath = index_path_for(args, root)
+            "hashes": hashes, "chunks": chunks}
     with open(ipath, "w") as f:
         json.dump(data, f)
-    print("embedx: indexed %d chunks from %d files -> %s"
-          % (len(chunks), len(data["files"]), ipath))
+    print("embedx: %d chunks (%d reused, %d embedded) from %d files -> %s"
+          % (len(chunks), reused, len(todo), len(data["files"]), ipath))
     return 0
 
 
@@ -232,6 +278,8 @@ def main(argv=None):
     pi.add_argument("--exts", default=None,
                     help="comma list of extensions, e.g. .py,.md")
     pi.add_argument("--batch", type=int, default=BATCH)
+    pi.add_argument("--force", action="store_true",
+                    help="re-embed everything, ignore stored file hashes")
     add_common(pi)
 
     ps = sub.add_parser("search", help="search the index")
