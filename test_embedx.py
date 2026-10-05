@@ -28,7 +28,10 @@ def vec_for(text):
 
 
 class Handler(BaseHTTPRequestHandler):
+    count = 0  # embedding requests served, so tests can assert skip behavior
+
     def do_POST(self):
+        Handler.count += 1
         assert self.path == "/v1/embeddings", self.path
         n = int(self.headers["Content-Length"])
         body = json.loads(self.rfile.read(n))
@@ -53,6 +56,10 @@ def start_server():
     import threading
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
+
+
+def reset_count():
+    Handler.count = 0
 
 
 BASE = None
@@ -150,7 +157,7 @@ def test_index_roundtrip():
         r = run_cli("index", d, "--index", ipath)
         check("index exit 0", r.returncode == 0)
         data = json.load(open(ipath))
-        check("index version", data["version"] == 1)
+        check("index version", data["version"] == 2)
         check("index model", data["model"] == "text-embedding-3-small")
         check("index dims", data["dims"] == 4)
         check("index files", set(data["files"]) == {"a.py", "b.py", "docs/c.md"})
@@ -209,6 +216,106 @@ def test_cli_errors():
         check("missing index nonzero", r.returncode == 1)
 
 
+def vecs_by_file(data):
+    out = {}
+    for c in data["chunks"]:
+        out.setdefault(c["file"], []).append(c["vec"])
+    return out
+
+
+def test_reindex_skips_unchanged():
+    with tempfile.TemporaryDirectory() as d:
+        sample_tree(d)
+        ipath = os.path.join(d, "idx.json")
+        r = run_cli("index", d, "--index", ipath)
+        check("first index ok", r.returncode == 0)
+        first = json.load(open(ipath))
+        reset_count()
+        r2 = run_cli("index", d, "--index", ipath, "--batch", "1")
+        check("reindex exit 0", r2.returncode == 0)
+        check("no api calls on unchanged tree", Handler.count == 0)
+        check("reuse reported", "reused" in r2.stdout)
+        second = json.load(open(ipath))
+        check("chunks identical", second["chunks"] == first["chunks"])
+        check("hashes stored", len(second["hashes"]) == 3)
+
+
+def test_reindex_changed_file():
+    with tempfile.TemporaryDirectory() as d:
+        sample_tree(d)
+        ipath = os.path.join(d, "idx.json")
+        run_cli("index", d, "--index", ipath)
+        before = vecs_by_file(json.load(open(ipath)))
+        write(d, "docs/c.md", "# cherry docs\n\napple pie recipe\n")
+        reset_count()
+        r = run_cli("index", d, "--index", ipath, "--batch", "1")
+        check("reindex after edit ok", r.returncode == 0)
+        check("only changed file embedded", Handler.count == 1)
+        after = vecs_by_file(json.load(open(ipath)))
+        check("unchanged vecs kept",
+              after["a.py"] == before["a.py"] and after["b.py"] == before["b.py"])
+        check("changed chunk re-embedded", after["docs/c.md"] != before["docs/c.md"])
+        check("chunk count stable", len(after["docs/c.md"]) == 1)
+
+
+def test_reindex_deleted_file():
+    with tempfile.TemporaryDirectory() as d:
+        sample_tree(d)
+        ipath = os.path.join(d, "idx.json")
+        run_cli("index", d, "--index", ipath)
+        os.remove(os.path.join(d, "b.py"))
+        reset_count()
+        r = run_cli("index", d, "--index", ipath, "--batch", "1")
+        check("reindex after delete ok", r.returncode == 0)
+        check("no embeds for a delete", Handler.count == 0)
+        data = json.load(open(ipath))
+        check("deleted chunks dropped",
+              all(c["file"] != "b.py" for c in data["chunks"]))
+        check("files list updated", set(data["files"]) == {"a.py", "docs/c.md"})
+
+
+def test_force_reembeds():
+    with tempfile.TemporaryDirectory() as d:
+        sample_tree(d)
+        ipath = os.path.join(d, "idx.json")
+        run_cli("index", d, "--index", ipath)
+        reset_count()
+        r = run_cli("index", d, "--index", ipath, "--force", "--batch", "1")
+        check("force exit 0", r.returncode == 0)
+        check("force re-embeds all", Handler.count == 6)
+
+
+def test_model_change_reembeds():
+    with tempfile.TemporaryDirectory() as d:
+        sample_tree(d)
+        ipath = os.path.join(d, "idx.json")
+        run_cli("index", d, "--index", ipath)
+        reset_count()
+        r = run_cli("index", d, "--index", ipath, "--batch", "1",
+                    "--model", "other-model")
+        check("model switch exit 0", r.returncode == 0)
+        check("model change re-embeds all", Handler.count == 6)
+        data = json.load(open(ipath))
+        check("model updated in index", data["model"] == "other-model")
+
+
+def test_hashless_index_reembeds():
+    # a v1 index has no hashes, the first re-index embeds everything once
+    with tempfile.TemporaryDirectory() as d:
+        sample_tree(d)
+        ipath = os.path.join(d, "idx.json")
+        run_cli("index", d, "--index", ipath)
+        data = json.load(open(ipath))
+        del data["hashes"]
+        data["version"] = 1
+        json.dump(data, open(ipath, "w"))
+        reset_count()
+        r = run_cli("index", d, "--index", ipath, "--batch", "1")
+        check("hashless index exit 0", r.returncode == 0)
+        check("hashless index re-embeds all", Handler.count == 6)
+        check("hashes added on rewrite", "hashes" in json.load(open(ipath)))
+
+
 if __name__ == "__main__":
     srv = start_server()
     BASE = "http://127.0.0.1:%d/v1" % srv.server_address[1]
@@ -222,6 +329,12 @@ if __name__ == "__main__":
         test_search_default_index()
         test_status()
         test_cli_errors()
+        test_reindex_skips_unchanged()
+        test_reindex_changed_file()
+        test_reindex_deleted_file()
+        test_force_reembeds()
+        test_model_change_reembeds()
+        test_hashless_index_reembeds()
     finally:
         srv.shutdown()
     print("%d passed, %d failed" % (passed, failed))
