@@ -195,6 +195,25 @@ def test_search_default_index():
         check("default index search", r2.stdout.splitlines()[0].startswith("docs/c.md"))
 
 
+def test_search_json():
+    with tempfile.TemporaryDirectory() as d:
+        sample_tree(d)
+        ipath = os.path.join(d, "idx.json")
+        run_cli("index", d, "--index", ipath)
+        r = run_cli("search", "apple pie", "--index", ipath, "--top", "2",
+                    "--json")
+        check("json search exit 0", r.returncode == 0)
+        hits = json.loads(r.stdout)
+        check("json search returns a list", isinstance(hits, list))
+        check("json search respects top", len(hits) == 2)
+        check("json top hit is apple", hits[0]["file"] == "a.py")
+        check("json hit fields", hits[0]["start"] == 1 and hits[0]["end"] == 40
+              and abs(hits[0]["score"] - 1.0) < 1e-9)
+        check("json hit carries chunk text", "apple line 0" in hits[0]["text"])
+        check("json scores sorted desc",
+              hits[0]["score"] >= hits[1]["score"])
+
+
 def test_status():
     with tempfile.TemporaryDirectory() as d:
         sample_tree(d)
@@ -327,6 +346,7 @@ if __name__ == "__main__":
         test_index_roundtrip()
         test_search_ranking()
         test_search_default_index()
+        test_search_json()
         test_status()
         test_cli_errors()
         test_reindex_skips_unchanged()
