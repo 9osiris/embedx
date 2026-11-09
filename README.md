@@ -13,6 +13,9 @@ python3 embedx.py index ~/code/myproj --exts .py,.md
 # search it
 python3 embedx.py search "where is retry logic handled" --dir ~/code/myproj --top 5
 
+# same search, machine readable (file, lines, score, full chunk text)
+python3 embedx.py search "where is retry logic handled" --dir ~/code/myproj --json
+
 # index stats
 python3 embedx.py status --dir ~/code/myproj
 ```
@@ -31,7 +34,7 @@ src/agent.py:112-151  0.6844
 Flags beat env vars. The API key is required for index and search.
 
 | flag | env | default |
-|---|---|
+|---|---|---|
 | `--base-url` | `EMBEDX_BASE_URL` or `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
 | `--api-key` | `EMBEDX_API_KEY` or `OPENAI_API_KEY` | (none) |
 | `--model` | `EMBEDX_MODEL` | `text-embedding-3-small` |
