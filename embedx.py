@@ -3,7 +3,7 @@
 
 usage:
   python3 embedx.py index <dir> [--exts .py,.md] [--index PATH]
-  python3 embedx.py search "query" [--dir .] [--top 8]
+  python3 embedx.py search "query" [--dir .] [--top 8] [--json]
   python3 embedx.py status [--dir .]
 
 config: --base-url (or EMBEDX_BASE_URL / OPENAI_BASE_URL),
@@ -236,6 +236,13 @@ def cmd_search(args):
     for c in data["chunks"]:
         scored.append((cosine(qvec, c["vec"]), c))
     scored.sort(key=lambda s: s[0], reverse=True)
+    if getattr(args, "json", False):
+        # machine readable hits for scripts: file, lines, score, full text
+        hits = [{"file": c["file"], "start": c["start"], "end": c["end"],
+                 "score": round(score, 4), "text": c["text"]}
+                for score, c in scored[:args.top]]
+        print(json.dumps(hits, indent=2))
+        return 0
     for score, c in scored[:args.top]:
         print("%s:%d-%d  %.4f" % (c["file"], c["start"], c["end"], score))
         for line in c["text"].splitlines()[:2]:
@@ -286,6 +293,8 @@ def main(argv=None):
     ps.add_argument("query")
     ps.add_argument("--dir", default=".")
     ps.add_argument("--top", type=int, default=8)
+    ps.add_argument("--json", action="store_true",
+                    help="print hits as json (file, lines, score, text)")
     add_common(ps)
 
     pt = sub.add_parser("status", help="show index stats")
